@@ -26,7 +26,8 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include "ads1220.h"
+#include <stdio.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -59,6 +60,75 @@ static void MPU_Config(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+/* printf 重定向: 输出到 USART1 */
+int __io_putchar(int ch)
+{
+    HAL_UART_Transmit(&huart1, (uint8_t *)&ch, 1, 100);
+    return ch;
+}
+
+/* ======================================================================== */
+/*  K 型热电偶 NIST 分度表 (0~100℃, 参考端 0℃, 步长 10℃)                     */
+/*  单位: mV                                                                  */
+/* ======================================================================== */
+typedef struct
+{
+    float temp;     /* 温度 (℃) */
+    float voltage;  /* 热电势 (mV) */
+} TC_TableEntry;
+
+static const TC_TableEntry tc_table_ktype[] = {
+    {  0,  0.000f },
+    { 10,  0.397f },
+    { 20,  0.798f },
+    { 30,  1.203f },
+    { 40,  1.612f },
+    { 50,  2.023f },
+    { 60,  2.436f },
+    { 70,  2.851f },
+    { 80,  3.267f },
+    { 90,  3.682f },
+    {100,  4.096f },
+};
+
+#define TC_TABLE_SIZE  (sizeof(tc_table_ktype) / sizeof(tc_table_ktype[0]))
+
+/* 冷端温度 25℃ 对应的 K 型热电势 (mV) */
+#define COLD_JUNCTION_MV  1.000f
+
+/**
+  * @brief  线性插值: 根据热电势查 K 型热电偶温度
+  * @param  mv  热电势 (mV), 已包含冷端补偿
+  * @retval 温度 (℃), 超出范围返回边界值
+  */
+static float TC_VoltageToTemp(float mv)
+{
+    /* 低于表格下限 */
+    if (mv <= tc_table_ktype[0].voltage)
+        return tc_table_ktype[0].temp;
+
+    /* 高于表格上限 */
+    if (mv >= tc_table_ktype[TC_TABLE_SIZE - 1].voltage)
+        return tc_table_ktype[TC_TABLE_SIZE - 1].temp;
+
+    /* 查找区间并线性插值 */
+    for (int i = 0; i < (int)(TC_TABLE_SIZE - 1); i++)
+    {
+        if (mv >= tc_table_ktype[i].voltage &&
+            mv <  tc_table_ktype[i + 1].voltage)
+        {
+            float v0 = tc_table_ktype[i].voltage;
+            float v1 = tc_table_ktype[i + 1].voltage;
+            float t0 = tc_table_ktype[i].temp;
+            float t1 = tc_table_ktype[i + 1].temp;
+
+            return t0 + (mv - v0) * (t1 - t0) / (v1 - v0);
+        }
+    }
+
+    return tc_table_ktype[TC_TABLE_SIZE - 1].temp;  /* fallback */
+}
 
 /* USER CODE END 0 */
 
@@ -108,12 +178,44 @@ int main(void)
   MX_SPI2_Init();
   /* USER CODE BEGIN 2 */
 
+  /* 初始化 ADS1220 (连续转换模式, 20 SPS, 增益 32) */
+  ADS1220_Init();
+  printf("ADS1220 initialized, measuring K-type thermocouple...\r\n");
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+    /* LED 闪烁指示正常运行 (~每 10 次采样翻转一次 ≈ 1.2s 周期) */
+    static uint32_t led_cnt = 0;
+    if (++led_cnt >= 10)
+    {
+      led_cnt = 0;
+      HAL_GPIO_TogglePin(LED0_GPIO_Port, LED0_Pin);
+    }
+
+    /* 读取原始 ADC 值和电压 */
+    int32_t raw = ADS1220_ReadRaw();
+    float measured_mv = (float)raw / 131072.0f;
+
+    /* 冷端补偿: 加上 25℃ 对应的 1.000 mV */
+    float total_mv = measured_mv + COLD_JUNCTION_MV;
+
+    /* 查表 + 线性插值得到实际温度 */
+    float temperature = TC_VoltageToTemp(total_mv);
+
+    /* 通过串口打印结果 */
+    printf("ADC: %7.3f mV (raw=0x%06lX) | ColdJ: +%.3f mV | Total: %7.3f mV | Temp: %.2f C\r\n",
+           (double)measured_mv,
+           (unsigned long)(raw & 0xFFFFFF),
+           (double)COLD_JUNCTION_MV,
+           (double)total_mv,
+           (double)temperature);
+
+    /* 20 SPS 每 50ms 一个数据, 留余量 */
+    HAL_Delay(60);
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
