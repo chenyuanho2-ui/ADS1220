@@ -118,50 +118,19 @@ void ADS1220_PowerDown(void)
 
 /**
   * @brief  初始化 ADS1220
-  *         配置寄存器:
-  *           Reg0 (0x0A): AIN0 vs AIN1 差分, PGA 增益 32
-  *           Reg1 (0x04): 20 SPS, 连续转换, 50/60Hz 同步抑制
-  *           Reg2 (0x10): IDAC 关闭
-  *           Reg3 (0x00): 默认
-  *         完成后发送 START 命令进入连续转换模式
+  *         使用单次转换模式，每次读取时手动触发转换
+  *         Reg0 (0x0A): AIN0 vs AIN1 差分, PGA 增益 32
+  *         Reg1 (0x14): 20 SPS, 单次转换模式
+  *         Reg2 (0x10): IDAC 关闭
+  *         Reg3 (0x00): 默认
   */
 void ADS1220_Init(void)
 {
-    uint8_t reg_val;
-
-    printf("[DBG] ADS1220_Init: Resetting device...\r\n");
-    ADS1220_Reset();
-    HAL_Delay(10);
-
-    /* 写入 4 个配置寄存器 */
-    printf("[DBG] Writing Reg0 = 0x0A (AIN0/AIN1 diff, Gain 32)...\r\n");
-    ADS1220_WriteRegister(ADS1220_REG_CONFIG0, 0x0A);
-    ADS1220_WriteRegister(ADS1220_REG_CONFIG1, 0x04);   /* 20 SPS, 连续转换 */
+    /* 写入配置: 单次转换模式 */
+    ADS1220_WriteRegister(ADS1220_REG_CONFIG0, 0x0A);   /* AIN0/AIN1 diff, Gain 32 */
+    ADS1220_WriteRegister(ADS1220_REG_CONFIG1, 0x14);   /* 20 SPS, 单次转换模式 */
     ADS1220_WriteRegister(ADS1220_REG_CONFIG2, 0x10);   /* IDAC off */
-    ADS1220_WriteRegister(ADS1220_REG_CONFIG3, 0x00);   /* 默认值 */
-
-    HAL_Delay(1);
-
-    /* 回读验证寄存器 */
-    reg_val = ADS1220_ReadRegister(ADS1220_REG_CONFIG0);
-    printf("[DBG] Readback Reg0 = 0x%02X (expected 0x0A)\r\n", reg_val);
-    reg_val = ADS1220_ReadRegister(ADS1220_REG_CONFIG1);
-    printf("[DBG] Readback Reg1 = 0x%02X (expected 0x04)\r\n", reg_val);
-    reg_val = ADS1220_ReadRegister(ADS1220_REG_CONFIG2);
-    printf("[DBG] Readback Reg2 = 0x%02X (expected 0x10)\r\n", reg_val);
-    reg_val = ADS1220_ReadRegister(ADS1220_REG_CONFIG3);
-    printf("[DBG] Readback Reg3 = 0x%02X (expected 0x00)\r\n", reg_val);
-
-    /* 启动连续转换 */
-    printf("[DBG] Sending START command...\r\n");
-    ADS1220_Start();
-
-    /* 等待首次转换完成 (20 SPS → 50ms, 留余量) */
-    HAL_Delay(60);
-
-    /* 检查 DRDY 状态 */
-    printf("[DBG] DRDY pin after init: %s\r\n",
-           ADS1220_DRDY_IS_LOW() ? "LOW (ready)" : "HIGH (busy/idle)");
+    ADS1220_WriteRegister(ADS1220_REG_CONFIG3, 0x00);
 }
 
 /* ======================================================================== */
@@ -169,33 +138,24 @@ void ADS1220_Init(void)
 /* ======================================================================== */
 
 /**
-  * @brief  读取 ADC 原始 24 位数据 (带符号扩展)
-  *         等待 DRDY 拉低后读取，100ms 超时保护
-  * @retval 有符号 24 位整型 (扩展至 int32_t)
+  * @brief  读取 ADC 原始 24 位数据 (单次转换模式)
+  *         每次调用: 发送 START → 等待 65ms → 发送 RDATA → 读取 3 字节
+  * @retval 有符号 24 位整型 (扩展至 int32_t), 超时返回 0x7FFFFF
   */
 int32_t ADS1220_ReadRaw(void)
 {
     uint8_t  buf[3] = {0};
     int32_t  result;
-    uint32_t timeout;
-    uint32_t drdy_pin_state;
 
-    /* 读取 DRDY 引脚当前电平 */
-    drdy_pin_state = HAL_GPIO_ReadPin(DRDY_GPIO_Port, DRDY_Pin);
+    /* 发送 START 触发单次转换 */
+    ADS1220_CS_LOW();
+    ADS1220_SPI_TransferByte(ADS1220_CMD_START);
+    ADS1220_CS_HIGH();
 
-    /* 等待 DRDY 拉低 (数据就绪) */
-    timeout = HAL_GetTick() + 100;   /* 100ms 超时 (20 SPS → 50ms 周期) */
-    while (!ADS1220_DRDY_IS_LOW())
-    {
-        if (HAL_GetTick() >= timeout)
-        {
-            printf("[DBG] DRDY wait timeout! DRDY pin = %s\r\n",
-                   drdy_pin_state == GPIO_PIN_RESET ? "LOW" : "HIGH");
-            return 0x7FFFFF;   /* 超时返回特殊值以便区分 */
-        }
-    }
+    /* 等待转换完成 (20 SPS = 50ms, 留余量 65ms) */
+    HAL_Delay(65);
 
-    /* 发送 RDATA 命令并读取 3 字节 */
+    /* 发送 RDATA 命令读取 3 字节 */
     ADS1220_CS_LOW();
     ADS1220_SPI_TransferByte(ADS1220_CMD_RDATA);
     buf[0] = ADS1220_SPI_TransferByte(0x00);
@@ -203,20 +163,13 @@ int32_t ADS1220_ReadRaw(void)
     buf[2] = ADS1220_SPI_TransferByte(0x00);
     ADS1220_CS_HIGH();
 
-    printf("[DBG] RAW bytes: 0x%02X 0x%02X 0x%02X\r\n", buf[0], buf[1], buf[2]);
-
-    /* 拼合 24 位数据 */
+    /* 拼合并符号扩展 */
     result = ((int32_t)buf[0] << 16)
            | ((int32_t)buf[1] << 8)
            | ((int32_t)buf[2] << 0);
 
-    /* 符号扩展: 如果最高位 (bit23) 为 1, 扩展高位 */
     if (result & 0x00800000)
-    {
         result |= 0xFF000000;
-    }
-
-    printf("[DBG] Raw ADC value (signed 24-bit): %ld (0x%08lX)\r\n", (long)result, (unsigned long)result);
 
     return result;
 }
